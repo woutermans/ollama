@@ -1,12 +1,15 @@
 package ollamarunner
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
 	"hash/maphash"
+	"image"
+	"image/jpeg"
 	"log"
 	"log/slog"
 	"net"
@@ -732,12 +735,73 @@ func (s *Server) reserveWorstCaseGraph() error {
 	ctx := s.model.Backend().NewContext()
 	defer ctx.Close()
 
+	var err error
+	inputs := make([]input.Input, s.batchSize)
+
+	// TODO: For Mistral, this is both slow and inaccurate because we compute the
+	// image embeddings during the forward pass, so we miss the entire vision encoder
+	// graph
+
+	// Multimodal strategy:
+	// - Encode a 1024x1024 image. This assumes that a single image of this
+	//   size is sufficient to trigger the worst case. This is currently true
+	//   because for existing models, only a single image fits in a batch.
+	// - Add the embedding to a full batch of tokens - this is necessary because
+	//   the model may be looking for non-image data, such as <image> tags.
+	// - Run PostTokenize to execute any transformations between generated
+	//   embeddings and what the forward pass expects.
+	// - The result may now be larger than a batch (images may not fit in a
+	//   single batch), so trim based on what will fit and must be grouped together.
+	// - Fill out the rest of the space with text tokens.
+	if multimodalProcessor, ok := s.model.(model.MultimodalProcessor); ok {
+		mmCtx := s.model.Backend().NewContext()
+		defer mmCtx.Close()
+
+		img := image.NewRGBA(image.Rect(0, 0, 1024, 1024))
+		var buf bytes.Buffer
+		jpeg.Encode(&buf, img, nil)
+
+		inputs[0].Multimodal, err = multimodalProcessor.EncodeMultimodal(mmCtx, buf.Bytes())
+		if err != nil {
+			// The model isn't really multimodal for this situation - just make a text batch.
+			goto formBatch
+		}
+
+		inputs, err = multimodalProcessor.PostTokenize(inputs)
+		if err != nil {
+			return err
+		}
+
+		for i, inp := range inputs {
+			minBatch := 1 + inp.SameBatch
+			if minBatch > s.batchSize {
+				inputs = inputs[i:min(i+minBatch, len(inputs))]
+				break
+			} else if i+minBatch > s.batchSize {
+				inputs = inputs[:i]
+				break
+			}
+		}
+
+		if len(inputs) < s.batchSize {
+			newInputs := make([]input.Input, s.batchSize)
+			copy(newInputs, inputs)
+			inputs = newInputs
+		}
+	}
+
+formBatch:
 	var batch input.Batch
 
-	inputs := make([]int32, s.batchSize)
+	batchInputs := make([]int32, len(inputs))
 	batch.Positions = make([]int32, len(inputs))
 	batch.Sequences = make([]int, len(inputs))
 	for i := range inputs {
+		batchInputs[i] = inputs[i].Token
+		if inputs[i].Multimodal != nil {
+			batch.Multimodal = append(batch.Multimodal, input.MultimodalIndex{Index: i, Multimodal: inputs[i].Multimodal})
+		}
+
 		batch.Positions[i] = int32(i)
 	}
 
@@ -746,8 +810,7 @@ func (s *Server) reserveWorstCaseGraph() error {
 		batch.Outputs[i] = int32(i)
 	}
 
-	var err error
-	batch.Inputs, err = ctx.Input().FromIntSlice(inputs, len(inputs))
+	batch.Inputs, err = ctx.Input().FromIntSlice(batchInputs, len(batchInputs))
 	if err != nil {
 		return err
 	}
